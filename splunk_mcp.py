@@ -13,6 +13,7 @@ from mcp.server.fastmcp import FastMCP
 from splunklib import results
 import sys
 import socket
+import asyncio
 from fastapi import FastAPI, APIRouter, Request
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from fastapi.staticfiles import StaticFiles
@@ -27,7 +28,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("splunk_mcp.log")
+        logging.FileHandler(os.path.join(os.path.dirname(__file__), "splunk_mcp.log"))
     ]
 )
 logger = logging.getLogger(__name__)
@@ -45,9 +46,8 @@ app = FastAPI(
 
 # Initialize the MCP server
 mcp = FastMCP(
-    "splunk",
-    description="A FastMCP-based tool for interacting with Splunk Enterprise/Cloud through natural language",
-    version="0.3.0",
+    name="splunk",
+    instructions="A FastMCP-based tool for interacting with Splunk Enterprise/Cloud through natural language",
     host="0.0.0.0",  # Listen on all interfaces
     port=FASTMCP_PORT
 )
@@ -295,35 +295,40 @@ SPLUNK_PASSWORD = os.environ.get("SPLUNK_PASSWORD", "admin")
 VERIFY_SSL = config("VERIFY_SSL", default="true", cast=bool)
 SPLUNK_TOKEN = os.environ.get("SPLUNK_TOKEN")  # New: support for token-based auth
 
-def get_splunk_connection() -> splunklib.client.Service:
+async def get_splunk_connection() -> splunklib.client.Service:
     """
-    Get a connection to the Splunk service.
+    Get a connection to the Splunk service asynchronously.
     Supports both username/password and token-based authentication.
     If SPLUNK_TOKEN is set, it will be used for authentication and username/password will be ignored.
     Returns:
         splunklib.client.Service: Connected Splunk service
     """
-    try:
+    def _connect():
         if SPLUNK_TOKEN:
             logger.debug(f"🔌 Connecting to Splunk at {SPLUNK_SCHEME}://{SPLUNK_HOST}:{SPLUNK_PORT} using token authentication")
-            service = splunklib.client.connect(
+            return splunklib.client.connect(
                 host=SPLUNK_HOST,
                 port=SPLUNK_PORT,
                 scheme=SPLUNK_SCHEME,
                 verify=VERIFY_SSL,
-                token=f"Bearer {SPLUNK_TOKEN}"
+                token=SPLUNK_TOKEN,
+                timeout=30  # 30 second timeout
             )
         else:
             username = os.environ.get("SPLUNK_USERNAME", "admin")
             logger.debug(f"🔌 Connecting to Splunk at {SPLUNK_SCHEME}://{SPLUNK_HOST}:{SPLUNK_PORT} as {username}")
-            service = splunklib.client.connect(
+            return splunklib.client.connect(
                 host=SPLUNK_HOST,
                 port=SPLUNK_PORT,
                 username=username,
                 password=SPLUNK_PASSWORD,
                 scheme=SPLUNK_SCHEME,
-                verify=VERIFY_SSL
+                verify=VERIFY_SSL,
+                timeout=30  # 30 second timeout
             )
+    
+    try:
+        service = await asyncio.to_thread(_connect)
         logger.debug(f"✅ Connected to Splunk successfully")
         return service
     except Exception as e:
@@ -353,24 +358,27 @@ async def search_splunk(search_query: str, earliest_time: str = "-24h", latest_t
         search_query = f"search {search_query}"
     
     try:
-        service = get_splunk_connection()
+        service = await get_splunk_connection()
         logger.info(f"🔍 Executing search: {search_query}")
         
-        # Create the search job
-        kwargs_search = {
-            "earliest_time": earliest_time,
-            "latest_time": latest_time,
-            "preview": False,
-            "exec_mode": "blocking"
-        }
+        def _execute_search():
+            # Create the search job
+            kwargs_search = {
+                "earliest_time": earliest_time,
+                "latest_time": latest_time,
+                "preview": False,
+                "exec_mode": "blocking"
+            }
+            
+            job = service.jobs.create(search_query, **kwargs_search)
+            
+            # Get the results
+            result_stream = job.results(output_mode='json', count=max_results)
+            results_data = json.loads(result_stream.read().decode('utf-8'))
+            
+            return results_data.get("results", [])
         
-        job = service.jobs.create(search_query, **kwargs_search)
-        
-        # Get the results
-        result_stream = job.results(output_mode='json', count=max_results)
-        results_data = json.loads(result_stream.read().decode('utf-8'))
-        
-        return results_data.get("results", [])
+        return await asyncio.to_thread(_execute_search)
         
     except Exception as e:
         logger.error(f"❌ Search failed: {str(e)}")
@@ -385,10 +393,14 @@ async def list_indexes() -> Dict[str, List[str]]:
         Dictionary containing list of indexes
     """
     try:
-        service = get_splunk_connection()
-        indexes = [index.name for index in service.indexes]
-        logger.info(f"📊 Found {len(indexes)} indexes")
-        return {"indexes": indexes}
+        service = await get_splunk_connection()
+        
+        def _list_indexes():
+            indexes = [index.name for index in service.indexes]
+            logger.info(f"📊 Found {len(indexes)} indexes")
+            return {"indexes": indexes}
+        
+        return await asyncio.to_thread(_list_indexes)
     except Exception as e:
         logger.error(f"❌ Failed to list indexes: {str(e)}")
         raise
@@ -405,17 +417,21 @@ async def get_index_info(index_name: str) -> Dict[str, Any]:
         Dictionary containing index metadata
     """
     try:
-        service = get_splunk_connection()
-        index = service.indexes[index_name]
+        service = await get_splunk_connection()
         
-        return {
-            "name": index_name,
-            "total_event_count": str(index["totalEventCount"]),
-            "current_size": str(index["currentDBSizeMB"]),
-            "max_size": str(index["maxTotalDataSizeMB"]),
-            "min_time": str(index["minTime"]),
-            "max_time": str(index["maxTime"])
-        }
+        def _get_index_info():
+            index = service.indexes[index_name]
+            
+            return {
+                "name": index_name,
+                "total_event_count": str(index["totalEventCount"]),
+                "current_size": str(index["currentDBSizeMB"]),
+                "max_size": str(index["maxTotalDataSizeMB"]),
+                "min_time": str(index["minTime"]),
+                "max_time": str(index["maxTime"])
+            }
+        
+        return await asyncio.to_thread(_get_index_info)
     except KeyError:
         logger.error(f"❌ Index not found: {index_name}")
         raise ValueError(f"Index not found: {index_name}")
@@ -432,21 +448,25 @@ async def list_saved_searches() -> List[Dict[str, Any]]:
         List of saved searches with their names, descriptions, and search queries
     """
     try:
-        service = get_splunk_connection()
-        saved_searches = []
+        service = await get_splunk_connection()
         
-        for saved_search in service.saved_searches:
-            try:
-                saved_searches.append({
-                    "name": saved_search.name,
-                    "description": saved_search.description or "",
-                    "search": saved_search.search
-                })
-            except Exception as e:
-                logger.warning(f"⚠️ Error processing saved search: {str(e)}")
-                continue
+        def _list_saved_searches():
+            saved_searches = []
             
-        return saved_searches
+            for saved_search in service.saved_searches:
+                try:
+                    saved_searches.append({
+                        "name": saved_search.name,
+                        "description": saved_search.description or "",
+                        "search": saved_search.search
+                    })
+                except Exception as e:
+                    logger.warning(f"⚠️ Error processing saved search: {str(e)}")
+                    continue
+                
+            return saved_searches
+        
+        return await asyncio.to_thread(_list_saved_searches)
         
     except Exception as e:
         logger.error(f"❌ Failed to list saved searches: {str(e)}")
@@ -467,7 +487,7 @@ async def current_user() -> Dict[str, Any]:
         Dict[str, Any]: Dictionary containing user information
     """
     try:
-        service = get_splunk_connection()
+        service = await get_splunk_connection()
         logger.info("👤 Fetching current user information...")
         
         # First try to get username from environment variable
@@ -544,7 +564,7 @@ async def current_user() -> Dict[str, Any]:
 async def list_users() -> List[Dict[str, Any]]:
     """List all Splunk users (requires admin privileges)"""
     try:
-        service = get_splunk_connection()
+        service = await get_splunk_connection()
         logger.info("👥 Fetching Splunk users...")
                 
         users = []
@@ -609,7 +629,7 @@ async def list_kvstore_collections() -> List[Dict[str, Any]]:
         List of KV store collections with metadata including app, fields, and accelerated fields
     """
     try:
-        service = get_splunk_connection()
+        service = await get_splunk_connection()
         logger.info("📚 Fetching KV store collections...")
         
         collections = []
@@ -669,7 +689,7 @@ async def list_kvstore_collections() -> List[Dict[str, Any]]:
 async def health_check() -> Dict[str, Any]:
     """Get basic Splunk connection information and list available apps"""
     try:
-        service = get_splunk_connection()
+        service = await get_splunk_connection()
         logger.info("🏥 Performing health check...")
         
         # List available apps
@@ -724,7 +744,7 @@ async def get_indexes_and_sourcetypes() -> Dict[str, Any]:
             - metadata: Additional information about the search
     """
     try:
-        service = get_splunk_connection()
+        service = await get_splunk_connection()
         logger.info("📊 Fetching indexes and sourcetypes...")
         
         # Get list of indexes
